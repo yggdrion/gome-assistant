@@ -1,0 +1,14 @@
+services:
+  gome-assistant:
+    build: .
+    container_name: gome-assistant
+    environment:
+      - VM_URL=${VM_URL:-https://vm.r4b2.de}
+      - VM_USER=${VM_USER:-admin}
+      - VM_PASSWORD=${VM_PASSWORD}
+      - SHELLY_IP=${SHELLY_IP}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-60s}
+      - MIN_WATTS=${MIN_WATTS:-7}
+      - MAX_WATTS=${MAX_WATTS:-9}
+      - DRY_RUN=${DRY_RUN:-false}
+    restart: unless-stopped
