@@ -12,7 +12,8 @@ A helper service that monitors your Bambu Lab printer and automatically turns of
 
 - VictoriaMetrics with bambulab-exporter and shelly-exporter metrics
 - Shelly smart plug (Gen1) connected to your Bambu printer
-- The Shelly device name must contain "bambu" (case insensitive)
+- The Shelly device name must match the configured pattern (default: contains "bambu")
+- The Shelly IP is automatically discovered from the `ip_address` label in metrics
 
 ## Configuration
 
@@ -22,18 +23,18 @@ Copy `.env.sample` to `.env` and configure:
 cp .env.sample .env
 ```
 
-| Variable            | Description                         | Default              |
-| ------------------- | ----------------------------------- | -------------------- |
-| `VM_URL`            | VictoriaMetrics URL                 | `https://vm.r4b2.de` |
-| `VM_USER`           | Basic auth username                 | `admin`              |
-| `VM_PASSWORD`       | Basic auth password                 | (required)           |
-| `SHELLY_IP`         | IP address of the Shelly device     | (required)           |
-| `CHECK_INTERVAL`    | How often to check                  | `60s`                |
-| `MIN_WATTS`         | Minimum standby watts threshold     | `7`                  |
-| `MAX_WATTS`         | Maximum standby watts threshold     | `9`                  |
-| `STANDBY_DURATION`  | Time in standby before turning off  | `15m`                |
-| `BOOT_GRACE_PERIOD` | Grace period after printer turns on | `20m`                |
-| `DRY_RUN`           | Test mode without switching relay   | `false`              |
+| Variable                | Description                               | Default              |
+| ----------------------- | ----------------------------------------- | -------------------- |
+| `VM_URL`                | VictoriaMetrics URL                       | `https://vm.r4b2.de` |
+| `VM_USER`               | Basic auth username                       | `admin`              |
+| `VM_PASSWORD`           | Basic auth password                       | (required)           |
+| `SHELLY_DEVICE_PATTERN` | Regex pattern to match Shelly device name | `.*[Bb]ambu.*`       |
+| `CHECK_INTERVAL`        | How often to check                        | `60s`                |
+| `MIN_WATTS`             | Minimum standby watts threshold           | `7`                  |
+| `MAX_WATTS`             | Maximum standby watts threshold           | `9`                  |
+| `STANDBY_DURATION`      | Time in standby before turning off        | `15m`                |
+| `BOOT_GRACE_PERIOD`     | Grace period after printer turns on       | `20m`                |
+| `DRY_RUN`               | Test mode without switching relay         | `false`              |
 
 ## Running
 

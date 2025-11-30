@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 // Config holds the configuration for the assistant
@@ -17,7 +19,7 @@ type Config struct {
 	VictoriaMetricsURL      string
 	VictoriaMetricsUser     string
 	VictoriaMetricsPassword string
-	ShellyDeviceIP          string
+	ShellyDevicePattern     string
 	CheckInterval           time.Duration
 	MinWatts                float64
 	MaxWatts                float64
@@ -31,6 +33,7 @@ type State struct {
 	StandbyStartTime *time.Time // When the printer entered standby mode
 	LastRelayOnTime  *time.Time // When we last detected relay was turned on
 	WasOffline       bool       // Whether the printer was offline in the last check
+	ShellyIP         string     // Cached Shelly device IP from metrics
 }
 
 // VMQueryResult represents a VictoriaMetrics query result
@@ -46,12 +49,17 @@ type VMQueryResult struct {
 }
 
 func main() {
+	// Load .env file if it exists
+	if err := godotenv.Load(); err != nil {
+		log.Printf("No .env file found or error loading it: %v", err)
+	}
+
 	cfg := Config{}
 
 	flag.StringVar(&cfg.VictoriaMetricsURL, "vm-url", getEnv("VM_URL", "https://vm.r4b2.de"), "VictoriaMetrics URL")
 	flag.StringVar(&cfg.VictoriaMetricsUser, "vm-user", getEnv("VM_USER", "admin"), "VictoriaMetrics basic auth user")
 	flag.StringVar(&cfg.VictoriaMetricsPassword, "vm-password", getEnv("VM_PASSWORD", ""), "VictoriaMetrics basic auth password")
-	flag.StringVar(&cfg.ShellyDeviceIP, "shelly-ip", getEnv("SHELLY_IP", ""), "Shelly device IP address for relay control")
+	flag.StringVar(&cfg.ShellyDevicePattern, "shelly-pattern", getEnv("SHELLY_DEVICE_PATTERN", ".*[Bb]ambu.*"), "Regex pattern to match Shelly device name")
 	flag.DurationVar(&cfg.CheckInterval, "interval", parseDuration(getEnv("CHECK_INTERVAL", "60s")), "Check interval")
 	flag.Float64Var(&cfg.MinWatts, "min-watts", parseFloat(getEnv("MIN_WATTS", "7")), "Minimum watts threshold")
 	flag.Float64Var(&cfg.MaxWatts, "max-watts", parseFloat(getEnv("MAX_WATTS", "9")), "Maximum watts threshold")
@@ -63,13 +71,10 @@ func main() {
 	if cfg.VictoriaMetricsPassword == "" {
 		log.Fatal("VM_PASSWORD is required")
 	}
-	if cfg.ShellyDeviceIP == "" {
-		log.Fatal("SHELLY_IP is required")
-	}
 
 	log.Printf("Starting gome-assistant")
 	log.Printf("VictoriaMetrics URL: %s", cfg.VictoriaMetricsURL)
-	log.Printf("Shelly Device IP: %s", cfg.ShellyDeviceIP)
+	log.Printf("Shelly Device Pattern: %s", cfg.ShellyDevicePattern)
 	log.Printf("Check interval: %s", cfg.CheckInterval)
 	log.Printf("Watts threshold: %.1f - %.1f", cfg.MinWatts, cfg.MaxWatts)
 	log.Printf("Standby duration before off: %s", cfg.StandbyDuration)
@@ -93,7 +98,7 @@ func checkAndControl(cfg *Config, state *State) {
 	log.Println("Checking printer and power status...")
 
 	// First check if relay is on (power > 0 means relay is on)
-	watts, err := getShellyBambuWatts(cfg)
+	watts, shellyIP, err := getShellyBambuWatts(cfg)
 	if err != nil {
 		log.Printf("Error getting shelly watts: %v", err)
 		// If we can't get watts, printer might be offline (relay off)
@@ -103,6 +108,11 @@ func checkAndControl(cfg *Config, state *State) {
 			state.StandbyStartTime = nil
 		}
 		return
+	}
+
+	// Cache the Shelly IP for relay control
+	if shellyIP != "" {
+		state.ShellyIP = shellyIP
 	}
 
 	// Detect if printer was just turned on (was offline, now has power)
@@ -156,7 +166,9 @@ func checkAndControl(cfg *Config, state *State) {
 		elapsed := time.Since(*state.StandbyStartTime)
 		if elapsed >= cfg.StandbyDuration {
 			log.Printf("Printer has been in standby for %s (threshold: %s), turning off relay", elapsed.Round(time.Second), cfg.StandbyDuration)
-			if err := setShellyRelayOff(cfg); err != nil {
+			if state.ShellyIP == "" {
+				log.Printf("Error: No Shelly IP available")
+			} else if err := setShellyRelayOff(cfg, state.ShellyIP); err != nil {
 				log.Printf("Error turning off relay: %v", err)
 			} else {
 				log.Println("Relay turned off successfully")
@@ -202,30 +214,36 @@ func isBambuPrinting(cfg *Config) (bool, error) {
 	return false, nil
 }
 
-// getShellyBambuWatts gets the power consumption of the shelly device connected to bambu
-func getShellyBambuWatts(cfg *Config) (float64, error) {
-	// Query for shelly device with "bambu" in the name (case insensitive matching in metric labels)
-	query := `shelly_watts{device_name=~".*[Bb]ambu.*"}`
+// getShellyBambuWatts gets the power consumption and IP of the shelly device connected to bambu
+func getShellyBambuWatts(cfg *Config) (float64, string, error) {
+	// Query for shelly device matching the configured pattern
+	query := fmt.Sprintf(`shelly_watts{device_name=~"%s"}`, cfg.ShellyDevicePattern)
 	result, err := queryVM(cfg, query)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 
 	if len(result.Data.Result) == 0 {
-		return 0, fmt.Errorf("no shelly device with 'bambu' in name found")
+		return 0, "", fmt.Errorf("no shelly device matching pattern '%s' found", cfg.ShellyDevicePattern)
 	}
 
-	// Get the first matching device's power consumption
-	if len(result.Data.Result[0].Value) >= 2 {
-		valueStr, ok := result.Data.Result[0].Value[1].(string)
+	// Get the first matching device's power consumption and IP
+	device := result.Data.Result[0]
+	ipAddress := device.Metric["ip_address"]
+
+	if len(device.Value) >= 2 {
+		valueStr, ok := device.Value[1].(string)
 		if ok {
 			var watts float64
 			fmt.Sscanf(valueStr, "%f", &watts)
-			return watts, nil
+			if ipAddress != "" {
+				log.Printf("Found Shelly device at %s", ipAddress)
+			}
+			return watts, ipAddress, nil
 		}
 	}
 
-	return 0, fmt.Errorf("could not parse power value")
+	return 0, "", fmt.Errorf("could not parse power value")
 }
 
 // queryVM queries VictoriaMetrics with the given PromQL query
@@ -264,14 +282,14 @@ func queryVM(cfg *Config, query string) (*VMQueryResult, error) {
 }
 
 // setShellyRelayOff turns off the shelly relay
-func setShellyRelayOff(cfg *Config) error {
+func setShellyRelayOff(cfg *Config, shellyIP string) error {
 	if cfg.DryRun {
-		log.Println("[DRY RUN] Would turn off relay")
+		log.Printf("[DRY RUN] Would turn off relay at %s", shellyIP)
 		return nil
 	}
 
 	// Shelly Gen1 API endpoint to turn off relay
-	relayURL := fmt.Sprintf("http://%s/relay/0?turn=off", cfg.ShellyDeviceIP)
+	relayURL := fmt.Sprintf("http://%s/relay/0?turn=off", shellyIP)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Get(relayURL)
