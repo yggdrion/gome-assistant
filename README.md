@@ -22,16 +22,18 @@ Copy `.env.sample` to `.env` and configure:
 cp .env.sample .env
 ```
 
-| Variable         | Description                       | Default              |
-| ---------------- | --------------------------------- | -------------------- |
-| `VM_URL`         | VictoriaMetrics URL               | `https://vm.r4b2.de` |
-| `VM_USER`        | Basic auth username               | `admin`              |
-| `VM_PASSWORD`    | Basic auth password               | (required)           |
-| `SHELLY_IP`      | IP address of the Shelly device   | (required)           |
-| `CHECK_INTERVAL` | How often to check                | `60s`                |
-| `MIN_WATTS`      | Minimum standby watts threshold   | `7`                  |
-| `MAX_WATTS`      | Maximum standby watts threshold   | `9`                  |
-| `DRY_RUN`        | Test mode without switching relay | `false`              |
+| Variable            | Description                         | Default              |
+| ------------------- | ----------------------------------- | -------------------- |
+| `VM_URL`            | VictoriaMetrics URL                 | `https://vm.r4b2.de` |
+| `VM_USER`           | Basic auth username                 | `admin`              |
+| `VM_PASSWORD`       | Basic auth password                 | (required)           |
+| `SHELLY_IP`         | IP address of the Shelly device     | (required)           |
+| `CHECK_INTERVAL`    | How often to check                  | `60s`                |
+| `MIN_WATTS`         | Minimum standby watts threshold     | `7`                  |
+| `MAX_WATTS`         | Maximum standby watts threshold     | `9`                  |
+| `STANDBY_DURATION`  | Time in standby before turning off  | `15m`                |
+| `BOOT_GRACE_PERIOD` | Grace period after printer turns on | `20m`                |
+| `DRY_RUN`           | Test mode without switching relay   | `false`              |
 
 ## Running
 
@@ -63,8 +65,21 @@ docker compose up -d
 ## Logic
 
 ```
-IF bambulab_gcode_state != 1 AND bambulab_gcode_state != 2 (not printing/paused)
-  AND shelly_watts > 7 AND shelly_watts < 9 (standby power range)
-THEN
-  Turn off Shelly relay
+1. If printer was offline and is now on:
+   - Start boot grace period (20 min default)
+   - Don't check standby during this time
+
+2. If still in boot grace period:
+   - Skip all checks, let printer boot/start print
+
+3. If printer is printing (gcode_state = 1 or 2):
+   - Reset standby timer
+   - Skip power check
+
+4. If printer is idle AND power is in standby range (7-9W):
+   - Start standby timer if not already running
+   - If standby timer >= 15 minutes: Turn off relay
+
+5. If power leaves standby range:
+   - Reset standby timer
 ```

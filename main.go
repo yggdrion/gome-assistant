@@ -21,7 +21,16 @@ type Config struct {
 	CheckInterval           time.Duration
 	MinWatts                float64
 	MaxWatts                float64
+	StandbyDuration         time.Duration
+	BootGracePeriod         time.Duration
 	DryRun                  bool
+}
+
+// State tracks the current state of the assistant
+type State struct {
+	StandbyStartTime *time.Time // When the printer entered standby mode
+	LastRelayOnTime  *time.Time // When we last detected relay was turned on
+	WasOffline       bool       // Whether the printer was offline in the last check
 }
 
 // VMQueryResult represents a VictoriaMetrics query result
@@ -46,6 +55,8 @@ func main() {
 	flag.DurationVar(&cfg.CheckInterval, "interval", parseDuration(getEnv("CHECK_INTERVAL", "60s")), "Check interval")
 	flag.Float64Var(&cfg.MinWatts, "min-watts", parseFloat(getEnv("MIN_WATTS", "7")), "Minimum watts threshold")
 	flag.Float64Var(&cfg.MaxWatts, "max-watts", parseFloat(getEnv("MAX_WATTS", "9")), "Maximum watts threshold")
+	flag.DurationVar(&cfg.StandbyDuration, "standby-duration", parseDuration(getEnv("STANDBY_DURATION", "15m")), "Duration printer must be in standby before turning off")
+	flag.DurationVar(&cfg.BootGracePeriod, "boot-grace", parseDuration(getEnv("BOOT_GRACE_PERIOD", "20m")), "Grace period after printer is turned on before checking standby")
 	flag.BoolVar(&cfg.DryRun, "dry-run", getEnv("DRY_RUN", "false") == "true", "Dry run mode (don't actually switch relay)")
 	flag.Parse()
 
@@ -61,21 +72,59 @@ func main() {
 	log.Printf("Shelly Device IP: %s", cfg.ShellyDeviceIP)
 	log.Printf("Check interval: %s", cfg.CheckInterval)
 	log.Printf("Watts threshold: %.1f - %.1f", cfg.MinWatts, cfg.MaxWatts)
+	log.Printf("Standby duration before off: %s", cfg.StandbyDuration)
+	log.Printf("Boot grace period: %s", cfg.BootGracePeriod)
 	log.Printf("Dry run: %v", cfg.DryRun)
+
+	state := &State{}
 
 	ticker := time.NewTicker(cfg.CheckInterval)
 	defer ticker.Stop()
 
 	// Run immediately on start
-	checkAndControl(&cfg)
+	checkAndControl(&cfg, state)
 
 	for range ticker.C {
-		checkAndControl(&cfg)
+		checkAndControl(&cfg, state)
 	}
 }
 
-func checkAndControl(cfg *Config) {
+func checkAndControl(cfg *Config, state *State) {
 	log.Println("Checking printer and power status...")
+
+	// First check if relay is on (power > 0 means relay is on)
+	watts, err := getShellyBambuWatts(cfg)
+	if err != nil {
+		log.Printf("Error getting shelly watts: %v", err)
+		// If we can't get watts, printer might be offline (relay off)
+		if !state.WasOffline {
+			log.Println("Printer appears to be offline (can't read shelly watts)")
+			state.WasOffline = true
+			state.StandbyStartTime = nil
+		}
+		return
+	}
+
+	// Detect if printer was just turned on (was offline, now has power)
+	if state.WasOffline && watts > 0 {
+		now := time.Now()
+		state.LastRelayOnTime = &now
+		state.WasOffline = false
+		state.StandbyStartTime = nil
+		log.Printf("Printer was turned on, starting boot grace period of %s", cfg.BootGracePeriod)
+		return
+	}
+	state.WasOffline = false
+
+	// Check if we're still in boot grace period
+	if state.LastRelayOnTime != nil {
+		elapsed := time.Since(*state.LastRelayOnTime)
+		if elapsed < cfg.BootGracePeriod {
+			remaining := cfg.BootGracePeriod - elapsed
+			log.Printf("Still in boot grace period, %.0f minutes remaining", remaining.Minutes())
+			return
+		}
+	}
 
 	// Check if any bambu printer is currently printing
 	isPrinting, err := isBambuPrinting(cfg)
@@ -85,29 +134,47 @@ func checkAndControl(cfg *Config) {
 	}
 
 	if isPrinting {
-		log.Println("Printer is currently printing, skipping power check")
-		return
-	}
-
-	// Get shelly power consumption for bambu device
-	watts, err := getShellyBambuWatts(cfg)
-	if err != nil {
-		log.Printf("Error getting shelly watts: %v", err)
+		log.Println("Printer is currently printing, resetting standby timer")
+		state.StandbyStartTime = nil
 		return
 	}
 
 	log.Printf("Printer idle, current power consumption: %.2f watts", watts)
 
 	// Check if power is in the standby range (between min and max watts)
-	if watts > cfg.MinWatts && watts < cfg.MaxWatts {
-		log.Printf("Power consumption (%.2f W) is in standby range (%.1f - %.1f W), turning off relay", watts, cfg.MinWatts, cfg.MaxWatts)
-		if err := setShellyRelayOff(cfg); err != nil {
-			log.Printf("Error turning off relay: %v", err)
+	inStandbyRange := watts > cfg.MinWatts && watts < cfg.MaxWatts
+
+	if inStandbyRange {
+		// Start or continue standby timer
+		if state.StandbyStartTime == nil {
+			now := time.Now()
+			state.StandbyStartTime = &now
+			log.Printf("Printer entered standby mode, starting %s timer", cfg.StandbyDuration)
+			return
+		}
+
+		elapsed := time.Since(*state.StandbyStartTime)
+		if elapsed >= cfg.StandbyDuration {
+			log.Printf("Printer has been in standby for %s (threshold: %s), turning off relay", elapsed.Round(time.Second), cfg.StandbyDuration)
+			if err := setShellyRelayOff(cfg); err != nil {
+				log.Printf("Error turning off relay: %v", err)
+			} else {
+				log.Println("Relay turned off successfully")
+				state.StandbyStartTime = nil
+				state.WasOffline = true // Mark as offline since we just turned it off
+			}
 		} else {
-			log.Println("Relay turned off successfully")
+			remaining := cfg.StandbyDuration - elapsed
+			log.Printf("Printer in standby for %s, %.0f minutes until auto-off", elapsed.Round(time.Second), remaining.Minutes())
 		}
 	} else {
-		log.Printf("Power consumption (%.2f W) is outside standby range, no action needed", watts)
+		// Power outside standby range, reset timer
+		if state.StandbyStartTime != nil {
+			log.Printf("Power consumption (%.2f W) left standby range, resetting timer", watts)
+			state.StandbyStartTime = nil
+		} else {
+			log.Printf("Power consumption (%.2f W) is outside standby range (%.1f-%.1f W)", watts, cfg.MinWatts, cfg.MaxWatts)
+		}
 	}
 }
 
