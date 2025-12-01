@@ -1,6 +1,4 @@
-FROM golang:1.25-alpine AS builder
-
-RUN apk add --no-cache git ca-certificates
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
@@ -9,16 +7,14 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o exporter .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o main .
 
-FROM alpine:latest
+FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates
+RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /app/exporter .
+COPY --from=builder /app/main .
 
-EXPOSE 8080
-
-CMD ["./exporter"]
+CMD ["./main"]
