@@ -233,7 +233,7 @@ func getShellyBambuWatts(cfg *Config) (float64, string, error) {
 		valueStr, ok := device.Value[1].(string)
 		if ok {
 			var watts float64
-			fmt.Sscanf(valueStr, "%f", &watts)
+			_, _ = fmt.Sscanf(valueStr, "%f", &watts)
 			if ipAddress != "" {
 				log.Printf("Found Shelly device at %s", ipAddress)
 			}
@@ -292,7 +292,9 @@ func wasPowerTurnedOnRecently(cfg *Config, lookback time.Duration) (bool, error)
 	if err != nil {
 		return false, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -318,7 +320,7 @@ func wasPowerTurnedOnRecently(cfg *Config, lookback time.Duration) (bool, error)
 			if len(pair) >= 2 {
 				if valueStr, ok := pair[1].(string); ok {
 					var watts float64
-					fmt.Sscanf(valueStr, "%f", &watts)
+					_, _ = fmt.Sscanf(valueStr, "%f", &watts)
 
 					if watts < 5 {
 						previousLow = true
@@ -380,7 +382,9 @@ func getStandbyDuration(cfg *Config, minWatts, maxWatts float64, maxDuration tim
 	if err != nil {
 		return 0, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -410,7 +414,7 @@ func getStandbyDuration(cfg *Config, minWatts, maxWatts float64, maxDuration tim
 				valueStr, _ := pair[1].(string)
 
 				var watts float64
-				fmt.Sscanf(valueStr, "%f", &watts)
+				_, _ = fmt.Sscanf(valueStr, "%f", &watts)
 
 				if watts > minWatts && watts < maxWatts {
 					// Still in standby range
@@ -447,7 +451,9 @@ func queryVM(cfg *Config, query string) (*VMQueryResult, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
