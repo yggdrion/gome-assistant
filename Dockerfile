@@ -1,20 +1,24 @@
-FROM golang:1.23-alpine AS builder
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache git ca-certificates
 
 WORKDIR /app
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
-COPY *.go ./
+COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o gome-assistant .
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o exporter .
 
-FROM alpine:3.21
+FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates tzdata
+RUN apk add --no-cache ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /app/gome-assistant .
+COPY --from=builder /app/exporter .
 
-CMD ["./gome-assistant"]
+EXPOSE 8080
+
+CMD ["./exporter"]

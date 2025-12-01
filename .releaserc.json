@@ -1,0 +1,86 @@
+{
+    "branches": ["main"],
+    "plugins": [
+        [
+            "@semantic-release/commit-analyzer",
+            {
+                "releaseRules": [
+                    {
+                        "type": "chore",
+                        "release": "patch"
+                    }
+                ]
+            }
+        ],
+        [
+            "@semantic-release/release-notes-generator",
+            {
+                "preset": "conventionalcommits",
+                "presetConfig": {
+                    "types": [
+                        {
+                            "type": "feat",
+                            "section": "✨ Features"
+                        },
+                        {
+                            "type": "fix",
+                            "section": "🐛 Bug Fixes"
+                        },
+                        {
+                            "type": "docs",
+                            "section": "📝 Documentation"
+                        },
+                        {
+                            "type": "chore",
+                            "section": "🔧 Chores"
+                        },
+                        {
+                            "type": "test",
+                            "section": "🚨 Tests"
+                        },
+                        {
+                            "type": "perf",
+                            "section": "⚡ Performance"
+                        },
+                        {
+                            "type": "refactor",
+                            "section": "♻️ Refactoring"
+                        },
+                        {
+                            "type": "style",
+                            "section": "💎 Styling"
+                        },
+                        {
+                            "type": "build",
+                            "section": "🏗️ Build"
+                        },
+                        {
+                            "type": "ci",
+                            "section": "👷 CI/CD"
+                        }
+                    ]
+                }
+            }
+        ],
+        ["@semantic-release/changelog"],
+        [
+            "@semantic-release/github",
+            {
+                "addReleases": "bottom",
+                "releasedLabels": false,
+                "failComment": false,
+                "failTitle": false,
+                "assets": "release-assets/*"
+            }
+        ],
+        [
+            "@semantic-release/git",
+            {
+                "assets": ["CHANGELOG.md"],
+                "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}",
+                "pushForce": true
+            }
+        ],
+        ["semantic-release-export-data"]
+    ]
+}
