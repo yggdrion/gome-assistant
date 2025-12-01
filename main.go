@@ -30,10 +30,7 @@ type Config struct {
 
 // State tracks the current state of the assistant
 type State struct {
-	StandbyStartTime *time.Time // When the printer entered standby mode
-	LastRelayOnTime  *time.Time // When we last detected relay was turned on
-	WasOffline       bool       // Whether the printer was offline in the last check
-	ShellyIP         string     // Cached Shelly device IP from metrics
+	ShellyIP string // Cached Shelly device IP from metrics
 }
 
 // VMQueryResult represents a VictoriaMetrics query result
@@ -43,7 +40,8 @@ type VMQueryResult struct {
 		ResultType string `json:"resultType"`
 		Result     []struct {
 			Metric map[string]string `json:"metric"`
-			Value  []interface{}     `json:"value"`
+			Value  []interface{}     `json:"value"`  // For instant queries: [timestamp, value]
+			Values [][]interface{}   `json:"values"` // For range queries: [[timestamp, value], ...]
 		} `json:"result"`
 	} `json:"data"`
 }
@@ -97,16 +95,10 @@ func main() {
 func checkAndControl(cfg *Config, state *State) {
 	log.Println("Checking printer and power status...")
 
-	// First check if relay is on (power > 0 means relay is on)
+	// Get current shelly power consumption
 	watts, shellyIP, err := getShellyBambuWatts(cfg)
 	if err != nil {
 		log.Printf("Error getting shelly watts: %v", err)
-		// If we can't get watts, printer might be offline (relay off)
-		if !state.WasOffline {
-			log.Println("Printer appears to be offline (can't read shelly watts)")
-			state.WasOffline = true
-			state.StandbyStartTime = nil
-		}
 		return
 	}
 
@@ -115,28 +107,27 @@ func checkAndControl(cfg *Config, state *State) {
 		state.ShellyIP = shellyIP
 	}
 
-	// Detect if printer was just turned on (was offline, now has power)
-	if state.WasOffline && watts > 0 {
-		now := time.Now()
-		state.LastRelayOnTime = &now
-		state.WasOffline = false
-		state.StandbyStartTime = nil
-		log.Printf("Printer was turned on, starting boot grace period of %s", cfg.BootGracePeriod)
+	// Safety check: Ensure we have metrics availability
+	hasRecentMetrics, err := hasRecentShellyMetrics(cfg, cfg.CheckInterval*2)
+	if err != nil || !hasRecentMetrics {
+		log.Printf("WARNING: No recent Shelly metrics found, skipping relay control for safety")
 		return
 	}
-	state.WasOffline = false
 
-	// Check if we're still in boot grace period
-	if state.LastRelayOnTime != nil {
-		elapsed := time.Since(*state.LastRelayOnTime)
-		if elapsed < cfg.BootGracePeriod {
-			remaining := cfg.BootGracePeriod - elapsed
-			log.Printf("Still in boot grace period, %.0f minutes remaining", remaining.Minutes())
-			return
-		}
+	// Check if printer was recently turned on (relay went from off to on)
+	// Look back BootGracePeriod + 1 minute to see power transitions
+	powerOnRecently, err := wasPowerTurnedOnRecently(cfg, cfg.BootGracePeriod)
+	if err != nil {
+		log.Printf("Error checking power transition history: %v", err)
+		return
 	}
 
-	// Check if any bambu printer is currently printing
+	if powerOnRecently {
+		log.Printf("Printer was turned on within boot grace period (%s), skipping checks", cfg.BootGracePeriod)
+		return
+	}
+
+	// Check if any bambu printer is currently printing or was printing recently
 	isPrinting, err := isBambuPrinting(cfg)
 	if err != nil {
 		log.Printf("Error checking bambu print status: %v", err)
@@ -144,49 +135,50 @@ func checkAndControl(cfg *Config, state *State) {
 	}
 
 	if isPrinting {
-		log.Println("Printer is currently printing, resetting standby timer")
-		state.StandbyStartTime = nil
+		log.Println("Printer is currently printing, no action taken")
+		return
+	}
+
+	// Check if printer was printing recently (within last 15 minutes for safety)
+	wasPrintingRecently, err := wasPrintingRecently(cfg, 15*time.Minute)
+	if err != nil {
+		log.Printf("Error checking recent print history: %v", err)
+		return
+	}
+
+	if wasPrintingRecently {
+		log.Println("Printer was printing recently, waiting before checking standby")
 		return
 	}
 
 	log.Printf("Printer idle, current power consumption: %.2f watts", watts)
 
-	// Check if power is in the standby range (between min and max watts)
-	inStandbyRange := watts > cfg.MinWatts && watts < cfg.MaxWatts
+	// Check if power has been in standby range for the required duration
+	inStandbyRange := watts >= cfg.MinWatts && watts <= cfg.MaxWatts
+	if !inStandbyRange {
+		log.Printf("Power consumption (%.2f W) is outside standby range (%.1f-%.1f W)", watts, cfg.MinWatts, cfg.MaxWatts)
+		return
+	}
 
-	if inStandbyRange {
-		// Start or continue standby timer
-		if state.StandbyStartTime == nil {
-			now := time.Now()
-			state.StandbyStartTime = &now
-			log.Printf("Printer entered standby mode, starting %s timer", cfg.StandbyDuration)
-			return
-		}
+	// Query metrics to see how long power has been in standby range
+	standbyDuration, err := getStandbyDuration(cfg, cfg.MinWatts, cfg.MaxWatts, cfg.StandbyDuration)
+	if err != nil {
+		log.Printf("Error checking standby duration: %v", err)
+		return
+	}
 
-		elapsed := time.Since(*state.StandbyStartTime)
-		if elapsed >= cfg.StandbyDuration {
-			log.Printf("Printer has been in standby for %s (threshold: %s), turning off relay", elapsed.Round(time.Second), cfg.StandbyDuration)
-			if state.ShellyIP == "" {
-				log.Printf("Error: No Shelly IP available")
-			} else if err := setShellyRelayOff(cfg, state.ShellyIP); err != nil {
-				log.Printf("Error turning off relay: %v", err)
-			} else {
-				log.Println("Relay turned off successfully")
-				state.StandbyStartTime = nil
-				state.WasOffline = true // Mark as offline since we just turned it off
-			}
+	if standbyDuration >= cfg.StandbyDuration {
+		log.Printf("Printer has been in standby for %s (threshold: %s), turning off relay", standbyDuration.Round(time.Second), cfg.StandbyDuration)
+		if state.ShellyIP == "" {
+			log.Printf("Error: No Shelly IP available")
+		} else if err := setShellyRelayOff(cfg, state.ShellyIP); err != nil {
+			log.Printf("Error turning off relay: %v", err)
 		} else {
-			remaining := cfg.StandbyDuration - elapsed
-			log.Printf("Printer in standby for %s, %.0f minutes until auto-off", elapsed.Round(time.Second), remaining.Minutes())
+			log.Println("Relay turned off successfully")
 		}
 	} else {
-		// Power outside standby range, reset timer
-		if state.StandbyStartTime != nil {
-			log.Printf("Power consumption (%.2f W) left standby range, resetting timer", watts)
-			state.StandbyStartTime = nil
-		} else {
-			log.Printf("Power consumption (%.2f W) is outside standby range (%.1f-%.1f W)", watts, cfg.MinWatts, cfg.MaxWatts)
-		}
+		remaining := cfg.StandbyDuration - standbyDuration
+		log.Printf("Printer in standby for %s, %.0f minutes until auto-off", standbyDuration.Round(time.Second), remaining.Minutes())
 	}
 }
 
@@ -244,6 +236,193 @@ func getShellyBambuWatts(cfg *Config) (float64, string, error) {
 	}
 
 	return 0, "", fmt.Errorf("could not parse power value")
+}
+
+// hasRecentShellyMetrics checks if shelly metrics have been updated recently
+func hasRecentShellyMetrics(cfg *Config, within time.Duration) (bool, error) {
+	query := fmt.Sprintf(`shelly_watts{device_name=~"%s"}`, cfg.ShellyDevicePattern)
+	result, err := queryVM(cfg, query)
+	if err != nil {
+		return false, err
+	}
+
+	if len(result.Data.Result) == 0 {
+		return false, nil
+	}
+
+	// Check if timestamp is recent
+	if len(result.Data.Result[0].Value) >= 2 {
+		timestampFloat, ok := result.Data.Result[0].Value[0].(float64)
+		if ok {
+			metricTime := time.Unix(int64(timestampFloat), 0)
+			age := time.Since(metricTime)
+			return age <= within, nil
+		}
+	}
+
+	return false, nil
+}
+
+// wasPowerTurnedOnRecently checks if power went from 0 to >0 within the lookback period
+func wasPowerTurnedOnRecently(cfg *Config, lookback time.Duration) (bool, error) {
+	// Query for power transitions using range query
+	query := fmt.Sprintf(`shelly_watts{device_name=~"%s"}`, cfg.ShellyDevicePattern)
+
+	// Use range query to look back
+	queryURL := fmt.Sprintf("%s/api/v1/query_range?query=%s&start=%d&end=%d&step=60s",
+		cfg.VictoriaMetricsURL,
+		url.QueryEscape(query),
+		time.Now().Add(-lookback-1*time.Minute).Unix(),
+		time.Now().Unix())
+
+	req, err := http.NewRequest("GET", queryURL, nil)
+	if err != nil {
+		return false, err
+	}
+	req.SetBasicAuth(cfg.VictoriaMetricsUser, cfg.VictoriaMetricsPassword)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("VM range query failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result VMQueryResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return false, err
+	}
+
+	if len(result.Data.Result) == 0 {
+		return false, nil
+	}
+
+	// Check for power transition from ~0 to >10W (indicating relay turned on)
+	// This would indicate printer was powered on
+	values := result.Data.Result[0].Values // Use Values for range query
+	if len(values) > 2 {
+		// Look for a transition from low to high power
+		var previousLow bool
+		for _, pair := range values {
+			if len(pair) >= 2 {
+				if valueStr, ok := pair[1].(string); ok {
+					var watts float64
+					fmt.Sscanf(valueStr, "%f", &watts)
+
+					if watts < 5 {
+						previousLow = true
+					} else if previousLow && watts > 10 {
+						// Found transition from off/low to on
+						return true, nil
+					}
+				}
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// wasPrintingRecently checks if the printer was printing within the lookback period
+func wasPrintingRecently(cfg *Config, lookback time.Duration) (bool, error) {
+	// Query for recent gcode_state values
+	query := `max_over_time(bambulab_gcode_state[` + lookback.String() + `])`
+	result, err := queryVM(cfg, query)
+	if err != nil {
+		return false, err
+	}
+
+	for _, r := range result.Data.Result {
+		if len(r.Value) >= 2 {
+			if valueStr, ok := r.Value[1].(string); ok {
+				// If max state in the period was 1 or 2 (running/paused), it was printing
+				if valueStr == "1" || valueStr == "2" {
+					return true, nil
+				}
+			}
+		}
+	}
+
+	return false, nil
+}
+
+// getStandbyDuration calculates how long power has been continuously in standby range
+func getStandbyDuration(cfg *Config, minWatts, maxWatts float64, maxDuration time.Duration) (time.Duration, error) {
+	// Query power values over the max duration + buffer
+	lookback := maxDuration + 5*time.Minute
+	query := fmt.Sprintf(`shelly_watts{device_name=~"%s"}`, cfg.ShellyDevicePattern)
+
+	queryURL := fmt.Sprintf("%s/api/v1/query_range?query=%s&start=%d&end=%d&step=60s",
+		cfg.VictoriaMetricsURL,
+		url.QueryEscape(query),
+		time.Now().Add(-lookback).Unix(),
+		time.Now().Unix())
+
+	req, err := http.NewRequest("GET", queryURL, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.SetBasicAuth(cfg.VictoriaMetricsUser, cfg.VictoriaMetricsPassword)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("VM range query failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result VMQueryResult
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, err
+	}
+
+	if len(result.Data.Result) == 0 {
+		return 0, nil
+	}
+
+	// Find the continuous period where power was in standby range
+	// Work backwards from most recent
+	values := result.Data.Result[0].Values // Use Values for range query
+	if len(values) > 0 {
+		var standbyStart *time.Time
+
+		// Iterate from newest to oldest
+		for i := len(values) - 1; i >= 0; i-- {
+			pair := values[i]
+			if len(pair) >= 2 {
+				timestampFloat, _ := pair[0].(float64)
+				valueStr, _ := pair[1].(string)
+
+				var watts float64
+				fmt.Sscanf(valueStr, "%f", &watts)
+
+				if watts > minWatts && watts < maxWatts {
+					// Still in standby range
+					t := time.Unix(int64(timestampFloat), 0)
+					standbyStart = &t
+				} else {
+					// Left standby range, stop
+					break
+				}
+			}
+		}
+
+		if standbyStart != nil {
+			return time.Since(*standbyStart), nil
+		}
+	}
+
+	return 0, nil
 }
 
 // queryVM queries VictoriaMetrics with the given PromQL query
