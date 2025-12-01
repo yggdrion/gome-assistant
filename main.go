@@ -30,7 +30,8 @@ type Config struct {
 
 // State tracks the current state of the assistant
 type State struct {
-	ShellyIP string // Cached Shelly device IP from metrics
+	ShellyIP         string     // Cached Shelly device IP from metrics
+	LastRelayOffTime *time.Time // When we last turned off the relay
 }
 
 // VMQueryResult represents a VictoriaMetrics query result
@@ -114,6 +115,16 @@ func checkAndControl(cfg *Config, state *State) {
 		return
 	}
 
+	// Safety check: If we recently turned off the relay, don't turn it off again
+	// This prevents race conditions where someone turns it back on immediately
+	if state.LastRelayOffTime != nil {
+		timeSinceLastOff := time.Since(*state.LastRelayOffTime)
+		if timeSinceLastOff < cfg.BootGracePeriod {
+			log.Printf("Relay was turned off %s ago, waiting for grace period to avoid race condition", timeSinceLastOff.Round(time.Second))
+			return
+		}
+	}
+
 	// Check if printer was recently turned on (relay went from off to on)
 	// Look back BootGracePeriod + 1 minute to see power transitions
 	powerOnRecently, err := wasPowerTurnedOnRecently(cfg, cfg.BootGracePeriod)
@@ -181,6 +192,8 @@ func checkAndControl(cfg *Config, state *State) {
 			log.Printf("Error turning off relay: %v", err)
 		} else {
 			log.Println("Relay turned off successfully")
+			now := time.Now()
+			state.LastRelayOffTime = &now
 		}
 	} else {
 		remaining := cfg.StandbyDuration - standbyDuration
