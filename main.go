@@ -151,13 +151,13 @@ func checkAndControl(cfg *Config, state *State) {
 		return
 	}
 
-	log.Printf("Printer idle, current power consumption: %.2f watts", watts)
-
-	// If power is already at 0, relay is already off
+	// If power is already at 0, printer/relay is already off
 	if watts == 0 {
-		log.Println("Relay is already off (0W), no action needed")
+		log.Println("Printer is off (0W), no action needed")
 		return
 	}
+
+	log.Printf("Printer idle, current power consumption: %.2f watts", watts)
 
 	// Check if power has been in standby range for the required duration
 	inStandbyRange := watts >= cfg.MinWatts && watts <= cfg.MaxWatts
